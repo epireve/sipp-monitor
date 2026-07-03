@@ -1,0 +1,421 @@
+name: SIPP Daily Connectivity Check
+
+on:
+  schedule:
+    # 01:30 UTC = 09:30 MYT (Malaysia, UTC+8) — weekdays only
+    - cron: "30 1 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      no_issues:
+        description: "Skip GitHub issue creation"
+        required: false
+        default: "false"
+        type: boolean
+      force_email:
+        description: "Send email even if no status changes"
+        required: false
+        default: "false"
+        type: boolean
+
+permissions:
+  contents: write       # push updated CSV + reports
+  issues: write         # open outage issues
+  actions: read
+
+env:
+  PYTHON_VERSION: "3.11"
+  GH_REPO: epireve/sipp-monitor
+  NOTIFY_EMAIL: i@firdaus.my
+  REPORT_DIR: reports
+  DATA_DIR: data
+
+jobs:
+  connectivity-check:
+    name: Run SIPP Connectivity Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    outputs:
+      went_down_count: ${{ steps.parse.outputs.went_down_count }}
+      came_back_count: ${{ steps.parse.outputs.came_back_count }}
+      major_alerts_count: ${{ steps.parse.outputs.major_alerts_count }}
+      active_count: ${{ steps.parse.outputs.active_count }}
+      report_date: ${{ steps.parse.outputs.report_date }}
+      has_changes: ${{ steps.parse.outputs.has_changes }}
+
+    steps:
+      # ── Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 1
+
+      # ── Python ────────────────────────────────────────────────────────────
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install --quiet aiohttp==3.9.5
+
+      # ── Restore state cache ───────────────────────────────────────────────
+      - name: Restore state cache
+        uses: actions/cache@v4
+        with:
+          path: data/state.json
+          key: sipp-state-${{ github.run_id }}
+          restore-keys: sipp-state-
+
+      # ── Run check ─────────────────────────────────────────────────────────
+      - name: Run connectivity check
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ env.GH_REPO }}
+        run: |
+          NO_ISSUES_FLAG=""
+          if [ "${{ inputs.no_issues }}" = "true" ]; then
+            NO_ISSUES_FLAG="--no-issues"
+          fi
+          python scripts/check_connectivity.py \
+            --output-dir ${{ env.REPORT_DIR }} \
+            --state-file ${{ env.DATA_DIR }}/state.json \
+            --courts-csv ${{ env.DATA_DIR }}/sipp_courts.csv \
+            $NO_ISSUES_FLAG
+        continue-on-error: false
+
+      # ── Parse report for outputs ──────────────────────────────────────────
+      - name: Parse check outputs
+        id: parse
+        run: |
+          REPORT_DATE=$(date -u +%Y-%m-%d)
+          echo "report_date=${REPORT_DATE}" >> $GITHUB_OUTPUT
+
+          REPORT_FILE="${{ env.REPORT_DIR }}/${REPORT_DATE}.md"
+
+          # Extract counts from report
+          if [ -f "$REPORT_FILE" ]; then
+            WENT_DOWN=$(grep -oP '(?<=Newly Inaccessible \()[0-9]+' "$REPORT_FILE" || echo "0")
+            CAME_BACK=$(grep -oP '(?<=Recovered \()[0-9]+' "$REPORT_FILE" || echo "0")
+            MAJOR=$(grep -oP '(?<=Major Jurisdiction Alerts)[^|]*\|[^|]*\|[^|]*rows' "$REPORT_FILE" | wc -l || echo "0")
+            ACTIVE=$(grep -oP '\*\*[0-9]+ / 349' "$REPORT_FILE" | grep -oP '[0-9]+' | head -1 || echo "0")
+          else
+            WENT_DOWN=0
+            CAME_BACK=0
+            MAJOR=0
+            ACTIVE=0
+          fi
+
+          # Simpler: count from state.json
+          WENT_DOWN=$(python3 -c "
+          import json, sys
+          try:
+              s = json.load(open('data/state.json'))
+              # Count new downs (no first_down_at in old state but has one now)
+              print(sum(1 for v in s.values() if v.get('connectivity') not in ['ACTIVE','ACTIVE_RESTRICTED','REDIRECT','REDIRECT_NONSTANDARD'] and v.get('first_down_at') and v['first_down_at'][:10] == '$(date -u +%Y-%m-%d)'))
+          except: print(0)
+          " 2>/dev/null || echo "0")
+
+          MAJOR=$(python3 -c "
+          import json
+          from datetime import datetime, timezone
+          try:
+              s = json.load(open('data/state.json'))
+              major_hosts = {
+                'sipp.pn-jakartapusat.go.id','sipp.pn-jakartaselatan.go.id','sipp.pn-jakartabarat.go.id',
+                'sipp.pn-jakartautara.go.id','sipp.pn-jakartatimur.go.id','sipp.pn-surabaya.go.id',
+                'sipp.pn-bandung.go.id','sipp.pn-medan.go.id','sipp.pn-semarangkota.go.id',
+                'sipp.pn-makassar.go.id','sipp.pn-palembang.go.id','sipp.pn-pekanbaru.go.id',
+                'sipp.pn-banjarmasin.go.id','sipp.pn-pontianak.go.id','sipp.pn-samarinda.go.id',
+                'sipp.pn-balikpapan.go.id','sipp.pn-manado.go.id','sipp.pn-denpasar.go.id',
+                'sipp.pn-mataram.go.id','sipp.pn-kupang.go.id','sipp.pn-ambon.go.id',
+                'sipp.pn-jayapura.go.id','sipp.pn-yogyakarta.go.id','sipp.pn-malang.go.id',
+                'sipp.pn-bekasi.go.id','sipp.pn-tangerang.go.id','sipp.pn-bogor.go.id'
+              }
+              now = datetime.now(timezone.utc)
+              count = 0
+              for url, v in s.items():
+                  host = url.replace('https://','').replace('http://','').rstrip('/')
+                  if host in major_hosts and v.get('connectivity') not in ['ACTIVE','ACTIVE_RESTRICTED','REDIRECT','REDIRECT_NONSTANDARD']:
+                      fd = v.get('first_down_at','')
+                      if fd:
+                          down_since = datetime.fromisoformat(fd.replace('Z','+00:00'))
+                          if (now - down_since).total_seconds() >= 86400:
+                              count += 1
+              print(count)
+          except Exception as e:
+              print(0)
+          " 2>/dev/null || echo "0")
+
+          echo "went_down_count=${WENT_DOWN}" >> $GITHUB_OUTPUT
+          echo "came_back_count=${CAME_BACK:-0}" >> $GITHUB_OUTPUT
+          echo "major_alerts_count=${MAJOR}" >> $GITHUB_OUTPUT
+          echo "active_count=${ACTIVE:-0}" >> $GITHUB_OUTPUT
+
+          # has_changes = true if went_down or came_back or major alerts
+          if [ "${WENT_DOWN:-0}" -gt 0 ] || [ "${MAJOR:-0}" -gt 0 ]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          fi
+
+      # ── Ensure issue labels exist ─────────────────────────────────────────
+      - name: Ensure GitHub labels exist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh label create "sipp-outage" --color "d93f0b" --description "SIPP court URL outage" --repo ${{ env.GH_REPO }} 2>/dev/null || true
+          gh label create "major-jurisdiction" --color "e4e669" --description "Major jurisdiction court" --repo ${{ env.GH_REPO }} 2>/dev/null || true
+          gh label create "auto-generated" --color "0075ca" --description "Created by sipp-monitor bot" --repo ${{ env.GH_REPO }} 2>/dev/null || true
+
+      # ── Commit updated data ───────────────────────────────────────────────
+      - name: Commit reports and updated CSV
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name  "sipp-monitor[bot]"
+          git config user.email "sipp-monitor[bot]@users.noreply.github.com"
+
+          git add \
+            data/sipp_courts.csv \
+            data/state.json \
+            reports/ \
+            --force
+
+          REPORT_DATE=$(date -u +%Y-%m-%d)
+
+          # Only commit if there are actual changes
+          if git diff --cached --quiet; then
+            echo "No file changes to commit."
+          else
+            git commit -m "chore: SIPP check ${REPORT_DATE} [skip ci]
+
+          Active: ${{ steps.parse.outputs.active_count }}/349
+          Newly down: ${{ steps.parse.outputs.went_down_count }}
+          Major alerts: ${{ steps.parse.outputs.major_alerts_count }}"
+            git push origin HEAD:main
+            echo "Changes committed and pushed."
+          fi
+
+      # ── Save state cache ──────────────────────────────────────────────────
+      - name: Save state cache
+        uses: actions/cache@v4
+        with:
+          path: data/state.json
+          key: sipp-state-${{ github.run_id }}
+
+  # ── Email report ─────────────────────────────────────────────────────────────
+  send-email:
+    name: Send Daily Email Report
+    runs-on: ubuntu-latest
+    needs: connectivity-check
+    if: always() && needs.connectivity-check.result == 'success'
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Determine if email should send
+        id: should_send
+        run: |
+          # Send if: forced, has changes, or it's Monday (weekly baseline)
+          DAY_OF_WEEK=$(date -u +%u)  # 1=Mon, 7=Sun
+          FORCE="${{ inputs.force_email }}"
+          HAS_CHANGES="${{ needs.connectivity-check.outputs.has_changes }}"
+          MAJOR="${{ needs.connectivity-check.outputs.major_alerts_count }}"
+
+          if [ "$FORCE" = "true" ] || [ "$HAS_CHANGES" = "true" ] || \
+             [ "$MAJOR" != "" ] && [ "$MAJOR" -gt 0 ] || \
+             [ "$DAY_OF_WEEK" = "1" ]; then
+            echo "send=true" >> $GITHUB_OUTPUT
+            echo "Email will be sent (force=${FORCE}, changes=${HAS_CHANGES}, major=${MAJOR}, day=${DAY_OF_WEEK})"
+          else
+            echo "send=false" >> $GITHUB_OUTPUT
+            echo "No email needed (no changes, not Monday)"
+          fi
+
+      - name: Prepare email content
+        if: steps.should_send.outputs.send == 'true'
+        id: email_content
+        run: |
+          REPORT_DATE="${{ needs.connectivity-check.outputs.report_date }}"
+          REPORT_FILE="reports/${REPORT_DATE}.md"
+
+          if [ ! -f "$REPORT_FILE" ]; then
+            REPORT_FILE="reports/latest.md"
+          fi
+
+          # Build alert prefix for subject
+          MAJOR="${{ needs.connectivity-check.outputs.major_alerts_count }}"
+          WENT_DOWN="${{ needs.connectivity-check.outputs.went_down_count }}"
+          ACTIVE="${{ needs.connectivity-check.outputs.active_count }}"
+
+          if [ "${MAJOR:-0}" -gt 0 ]; then
+            SUBJECT="🔴 [SIPP Alert] ${MAJOR} major jurisdiction(s) down — ${REPORT_DATE}"
+          elif [ "${WENT_DOWN:-0}" -gt 0 ]; then
+            SUBJECT="🟡 [SIPP Monitor] ${WENT_DOWN} court(s) newly offline — ${REPORT_DATE}"
+          else
+            SUBJECT="✅ [SIPP Monitor] Weekly baseline — ${ACTIVE}/349 active — ${REPORT_DATE}"
+          fi
+
+          # Convert markdown to HTML (basic)
+          pip install --quiet markdown 2>/dev/null || true
+
+          HTML_REPORT=$(python3 -c "
+          import markdown, sys
+          try:
+              with open('${REPORT_FILE}') as f:
+                  md = f.read()
+              html = markdown.markdown(md, extensions=['tables','fenced_code'])
+              print(html)
+          except Exception as e:
+              print(f'<p>Report unavailable: {e}</p>')
+          ")
+
+          # Write HTML email body
+          cat > /tmp/email_body.html << 'HTMLEOF'
+          <!DOCTYPE html>
+          <html>
+          <head>
+          <meta charset="UTF-8">
+          <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 900px; margin: 0 auto; padding: 20px; color: #24292f; }
+            h1 { color: #0969da; border-bottom: 2px solid #0969da; padding-bottom: 8px; }
+            h2 { color: #1a7f37; margin-top: 24px; }
+            h3 { color: #9a6700; }
+            table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 13px; }
+            th { background: #f6f8fa; border: 1px solid #d0d7de; padding: 8px 12px; text-align: left; }
+            td { border: 1px solid #d0d7de; padding: 6px 12px; }
+            tr:nth-child(even) { background: #f6f8fa; }
+            code { background: #afb8c133; padding: 2px 6px; border-radius: 4px; font-size: 12px; }
+            .footer { margin-top: 32px; padding-top: 16px; border-top: 1px solid #d0d7de; font-size: 12px; color: #57606a; }
+            .alert-box { background: #fff8c5; border: 1px solid #d4a72c; border-radius: 6px; padding: 12px 16px; margin: 12px 0; }
+          </style>
+          </head>
+          <body>
+          HTMLEOF
+
+          echo "$HTML_REPORT" >> /tmp/email_body.html
+
+          cat >> /tmp/email_body.html << 'HTMLEOF'
+          <div class="footer">
+            <p>
+              Generated by <a href="https://github.com/epireve/sipp-monitor">epireve/sipp-monitor</a> ·
+              <a href="https://github.com/epireve/sipp-monitor/tree/main/reports">View all reports</a> ·
+              <a href="https://github.com/epireve/sipp-monitor/issues?q=label%3Asipp-outage">Open issues</a>
+            </p>
+          </div>
+          </body>
+          </html>
+          HTMLEOF
+
+          echo "subject=${SUBJECT}" >> $GITHUB_OUTPUT
+          echo "report_file=${REPORT_FILE}" >> $GITHUB_OUTPUT
+
+      - name: Send email via SendGrid
+        if: steps.should_send.outputs.send == 'true' && secrets.SENDGRID_API_KEY != ''
+        env:
+          SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
+        run: |
+          SUBJECT="${{ steps.email_content.outputs.subject }}"
+          HTML_CONTENT=$(cat /tmp/email_body.html | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))")
+
+          python3 << PYEOF
+          import os, json, urllib.request, urllib.error
+
+          api_key = os.environ["SENDGRID_API_KEY"]
+          subject = """${{ steps.email_content.outputs.subject }}"""
+          to_email = "${{ env.NOTIFY_EMAIL }}"
+          from_email = "sipp-monitor@epireve.com"  # must be verified sender in SendGrid
+
+          with open("/tmp/email_body.html") as f:
+              html = f.read()
+
+          payload = {
+              "personalizations": [{"to": [{"email": to_email}]}],
+              "from": {"email": from_email, "name": "SIPP Monitor"},
+              "subject": subject,
+              "content": [{"type": "text/html", "value": html}]
+          }
+
+          req = urllib.request.Request(
+              "https://api.sendgrid.com/v3/mail/send",
+              data=json.dumps(payload).encode(),
+              headers={
+                  "Authorization": f"Bearer {api_key}",
+                  "Content-Type": "application/json"
+              },
+              method="POST"
+          )
+
+          try:
+              with urllib.request.urlopen(req) as resp:
+                  print(f"Email sent successfully (HTTP {resp.status})")
+          except urllib.error.HTTPError as e:
+              body = e.read().decode()
+              print(f"SendGrid error {e.code}: {body}")
+              raise
+          PYEOF
+
+      - name: Send email via Gmail SMTP (fallback)
+        if: steps.should_send.outputs.send == 'true' && secrets.SENDGRID_API_KEY == '' && secrets.GMAIL_APP_PASSWORD != ''
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+        run: |
+          python3 << PYEOF
+          import os, smtplib
+          from email.mime.multipart import MIMEMultipart
+          from email.mime.text import MIMEText
+
+          gmail_user = os.environ.get("GMAIL_USER", "")
+          gmail_pass = os.environ.get("GMAIL_APP_PASSWORD", "")
+          to_email = "${{ env.NOTIFY_EMAIL }}"
+          subject = """${{ steps.email_content.outputs.subject }}"""
+
+          with open("/tmp/email_body.html") as f:
+              html = f.read()
+
+          msg = MIMEMultipart("alternative")
+          msg["Subject"] = subject
+          msg["From"] = f"SIPP Monitor <{gmail_user}>"
+          msg["To"] = to_email
+          msg.attach(MIMEText(html, "html"))
+
+          with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+              server.login(gmail_user, gmail_pass)
+              server.sendmail(gmail_user, [to_email], msg.as_string())
+          print(f"Email sent to {to_email}")
+          PYEOF
+
+      - name: Log email skip
+        if: steps.should_send.outputs.send == 'false'
+        run: |
+          echo "No email sent — no material changes and not a weekly baseline day."
+          echo "To force an email, re-run with 'force_email: true'"
+
+  # ── Alert on major outage ────────────────────────────────────────────────────
+  major-outage-alert:
+    name: Major Outage Slack/Comment Alert
+    runs-on: ubuntu-latest
+    needs: connectivity-check
+    if: |
+      needs.connectivity-check.result == 'success' &&
+      needs.connectivity-check.outputs.major_alerts_count != '0' &&
+      needs.connectivity-check.outputs.major_alerts_count != ''
+    timeout-minutes: 3
+
+    steps:
+      - name: Post workflow notice
+        run: |
+          MAJOR="${{ needs.connectivity-check.outputs.major_alerts_count }}"
+          REPORT_DATE="${{ needs.connectivity-check.outputs.report_date }}"
+          echo "::warning title=Major SIPP Outage::${MAJOR} major jurisdiction court(s) have been offline >24h as of ${REPORT_DATE}. Check open issues at https://github.com/epireve/sipp-monitor/issues?q=label:sipp-outage+is:open"
